@@ -18,6 +18,7 @@
 #include <string>
 
 #include "linear-algebra.hh"
+#include "reduce-scan.hh"
 
 using clock_type = std::chrono::high_resolution_clock;
 using duration = clock_type::duration;
@@ -66,86 +67,99 @@ struct OpenCL {
     cl::CommandQueue queue;
 };
 
-void profile_vector_times_vector(int n, OpenCL& opencl) {
+void profile_reduce(int n, OpenCL& opencl) {
+    int loc_sz = 128;
     auto a = random_vector<float>(n);
-    auto b = random_vector<float>(n);
-    Vector<float> result(n), expected_result(n);
+    Vector<float> result(loc_sz);
+    float expected_result = 0;
     opencl.queue.flush();
-    cl::Kernel kernel(opencl.program, "vector_times_vector");
+    cl::Kernel kernel(opencl.program, "reduce");
     auto t0 = clock_type::now();
-    vector_times_vector(a, b, expected_result);
+    expected_result = reduce(a);
     auto t1 = clock_type::now();
     cl::Buffer d_a(opencl.queue, begin(a), end(a), true);
-    cl::Buffer d_b(opencl.queue, begin(b), end(b), true);
-    cl::Buffer d_result(opencl.context, CL_MEM_READ_WRITE, result.size()*sizeof(float));
-    kernel.setArg(0, d_a);
-    kernel.setArg(1, d_b);
-    kernel.setArg(2, d_result);
     opencl.queue.flush();
     auto t2 = clock_type::now();
-    opencl.queue.enqueueNDRangeKernel(kernel, cl::NullRange, cl::NDRange(n), cl::NullRange);
-    opencl.queue.flush();
-    auto t3 = clock_type::now();
-    cl::copy(opencl.queue, d_result, begin(result), end(result));
-    auto t4 = clock_type::now();
-    verify_vector(expected_result, result);
-    print("vector-times-vector",
-          {t1-t0,t4-t1,t2-t1,t3-t2,t4-t3},
-          {bandwidth(n+n+n, t0, t1), bandwidth(n+n+n, t2, t3)});
-}
+    auto t3 = t2;
+    auto t4 = t2;
+    int size = n / loc_sz;
+    while (1) {
+        kernel.setArg(0, d_a);
+        cl::Buffer d_result(opencl.context, CL_MEM_READ_WRITE, sizeof(float) * size);
+        kernel.setArg(1, d_result);
+        opencl.queue.enqueueNDRangeKernel(kernel, cl::NullRange, cl::NDRange(size * loc_sz), cl::NDRange(loc_sz));
+        d_a = d_result;
 
-void profile_matrix_times_vector(int n, OpenCL& opencl) {
-    auto a = random_matrix<float>(n,n);
-    auto b = random_vector<float>(n);
-    Vector<float> result(n), expected_result(n);
-    opencl.queue.flush();
-    cl::Kernel kernel(opencl.program, "matrix_times_vector");
-    auto t0 = clock_type::now();
-    matrix_times_vector(a, b, expected_result);
-    auto t1 = clock_type::now();
-    cl::Buffer d_a(opencl.queue, begin(a), end(a), true);
-    cl::Buffer d_b(opencl.queue, begin(b), end(b), true);
-    cl::Buffer d_result(opencl.context, CL_MEM_READ_WRITE, result.size()*sizeof(float));
-    kernel.setArg(0, d_a);
-    kernel.setArg(1, d_b);
-    kernel.setArg(2, d_result);
-    opencl.queue.flush();
-    auto t2 = clock_type::now();
-    opencl.queue.enqueueNDRangeKernel(kernel, cl::NullRange, cl::NDRange(n), cl::NullRange);
-    opencl.queue.flush();
-    auto t3 = clock_type::now();
-    cl::copy(opencl.queue, d_result, begin(result), end(result));
-    auto t4 = clock_type::now();
-    verify_vector(expected_result, result, 1e-1f);
-    print("matrix-times-vector",
+        if (size % loc_sz != 0 && size > loc_sz) {
+            // increase size to have room for remainder
+            size *= 2;
+        }
+        if (size <= loc_sz) {
+            opencl.queue.flush();
+            t3 = clock_type::now();
+            cl::copy(opencl.queue, d_result, std::begin(result), std::begin(result) + size);
+            t4 = clock_type::now();
+            break;
+        }
+        size /= loc_sz;
+    }
+    float sum = result[0];
+    if (std::abs(expected_result - sum) > 1e3) {
+        std::stringstream msg;
+        msg << "Invalid value: " << sum << ", expected: " << expected_result;
+        throw std::runtime_error(msg.str());
+    }
+    print("reduce",
           {t1-t0,t4-t1,t2-t1,t3-t2,t4-t3},
           {bandwidth(n*n+n+n, t0, t1), bandwidth(n*n+n+n, t2, t3)});
 }
 
-void profile_matrix_times_matrix(int n, OpenCL& opencl) {
-    auto a = random_matrix<float>(n,n);
-    auto b = random_matrix<float>(n,n);
-    Matrix<float> result(n,n), expected_result(n,n);
+void profile_scan_inclusive(int n, OpenCL& opencl) {
+    int loc_sz = 128; // optimal size on intel hd graphics?
+    auto a = random_vector<float>(n);
+    Vector<float> result(a), expected_result(a);
     opencl.queue.flush();
-    cl::Kernel kernel(opencl.program, "matrix_times_matrix");
+    cl::Kernel kernel(opencl.program, "scan_inclusive");
+    cl::Kernel kernel_fin(opencl.program, "finish_scan_inclusive");
+
     auto t0 = clock_type::now();
-    matrix_times_matrix(a, b, expected_result);
+    scan_inclusive(expected_result);
+
     auto t1 = clock_type::now();
-    cl::Buffer d_a(opencl.queue, begin(a), end(a), true);
-    cl::Buffer d_b(opencl.queue, begin(b), end(b), true);
-    cl::Buffer d_result(opencl.context, CL_MEM_READ_WRITE, result.size()*sizeof(float));
-    kernel.setArg(0, d_a);
-    kernel.setArg(1, d_b);
-    kernel.setArg(2, d_result);
-    opencl.queue.flush();
+    cl::Buffer d_a(opencl.queue, begin(a), end(a), false);
+    opencl.queue.finish();
+
     auto t2 = clock_type::now();
-    opencl.queue.enqueueNDRangeKernel(kernel, cl::NullRange, cl::NDRange(n, n), cl::NDRange(n / 4));
-    opencl.queue.flush();
+    int size = n;
+    int val = 1;
+    while (size > 1) {
+        kernel.setArg(0, d_a);
+        kernel.setArg(1, val);
+        if (size < loc_sz) {
+            loc_sz = size; // fix local size
+        }
+        opencl.queue.enqueueNDRangeKernel(kernel, cl::NullRange, cl::NDRange(size), cl::NDRange(loc_sz));
+        size /= loc_sz;
+        val *= loc_sz;
+    }
+    kernel_fin.setArg(0, d_a);
+    kernel_fin.setArg(1, loc_sz);
+    opencl.queue.enqueueNDRangeKernel(kernel_fin, cl::NullRange, cl::NDRange(n/loc_sz - 1), cl::NullRange);
+
+    opencl.queue.finish();
     auto t3 = clock_type::now();
-    cl::copy(opencl.queue, d_result, begin(result), end(result));
+    cl::copy(opencl.queue, d_a, begin(result), end(result));
     auto t4 = clock_type::now();
-    verify_matrix(expected_result, result, 1e-3f);
-    print("matrix-times-matrix",
+
+    float res = result[n - 1];
+    float expected_res = expected_result[n - 1];
+    if (std::abs(expected_res - res) > 1e3) {
+        std::stringstream msg;
+        msg << "Invalid value: " << res << ", expected: " << expected_res;
+        throw std::runtime_error(msg.str());
+    }
+
+    print("scan-inclusive",
           {t1-t0,t4-t1,t2-t1,t3-t2,t4-t3},
           {bandwidth(n*n+n*n+n*n, t0, t1), bandwidth(n*n+n*n+n*n, t2, t3)});
 }
@@ -153,60 +167,74 @@ void profile_matrix_times_matrix(int n, OpenCL& opencl) {
 void opencl_main(OpenCL& opencl) {
     using namespace std::chrono;
     print_column_names();
-    profile_vector_times_vector(1024*1024*10, opencl);
-    profile_matrix_times_vector(1024*10, opencl);
-    profile_matrix_times_matrix(1024, opencl);
+    profile_reduce(1024*1024*10, opencl);
+    profile_scan_inclusive(1024*1024*10, opencl);
 }
 
 const std::string src = R"(
-kernel void vector_times_vector(global float* a,
-                                global float* b,
-                                global float* result) {
+#define BUFFSIZE 1024
+kernel void reduce(global float* a,
+                   global float* result) {
+    const int m = get_local_size(0);
+    int t = get_local_id(0);
+    int k = get_group_id(0);
+    const int l = get_num_groups(0);
     const int i = get_global_id(0);
-    result[i] = a[i] * b[i];
-}
-#define BUFFSIZE (1024 * 12)
-kernel void matrix_times_vector(global const float* a,
-                                global const float* b,
-                                global float* result) {
-    const int i = get_global_id(0);
+
+    // move parts of array into local
+    local float buff[BUFFSIZE];
+    buff[t] = a[k * m + t];
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    // compute in local
+    for (int offset = m / 2; offset > 0; offset /= 2) {
+        if (t < offset) {
+            buff[t] += buff[t + offset];
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    if (t == 0) {
+        result[k] = buff[0];
+    }
     const int n = get_global_size(0);
-    int t = get_local_id(0);
-    const int m = get_local_size(0);
 
-    __local float vec[BUFFSIZE];
-    
-    for (int j = t; j < n; j += m) {
-        vec[j] = b[j];
+    // only use single work item
+    if (i == 0 && n / m <= m) {
+        float sum = 0;
+        for (int j = 0; j < l; j++)
+            sum += result[j];
+        result[0] = sum;
     }
-    barrier(CLK_LOCAL_MEM_FENCE);
-    float sum = 0;
-    for (int j=0; j<n; ++j) {
-        sum += a[i*n + j]*vec[j];
-    }
-    result[i] = sum;
 }
 
-__kernel void matrix_times_matrix(global const float *a,
-                                global const float *b,
-                                global float *result) {
-    const int id_x = get_global_id(0);
-    const int id_y = get_global_id(1);
-    int t = get_local_id(0);
+kernel void scan_inclusive(global float* a, int step) {
+    const int i = get_global_id(0);
+    const int t = get_local_id(0);
     const int m = get_local_size(0);
-    const int n = get_global_size(0); // assume [n, n]
 
-    __local float row[1024];
-    for (int j = t; j < n; j += m) {
-        row[j] = a[id_y * n + j]; // assume all work items have the same id_y
-    }
+    // move parts of array into local
+    local float buff[BUFFSIZE];
+    buff[t] = a[(step - 1) + i * step];
     barrier(CLK_LOCAL_MEM_FENCE);
-    float sum = 0;
-	for (int j = 0; j < n; j++) {
-		sum += row[j] * b[j * n + id_x];
+
+    float sum = buff[t];
+    // compute in local
+    for (int offset = 1; offset < m; offset *= 2) {
+        if (t >= offset) {
+            sum += buff[t - offset];
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+        buff[t] = sum;
+        barrier(CLK_LOCAL_MEM_FENCE);
     }
-	result[id_y * n + id_x] = sum;
-	
+    a[(step - 1) + i * step] = buff[t];
+}
+
+kernel void finish_scan_inclusive(global float* a, int step) {
+    const int i = get_global_id(0);
+    for (int j = 0; j < step - 1; j++) {
+        a[(i + 1) * step + j] += a[(i + 1) * step - 1];
+    }
 }
 )";
 
